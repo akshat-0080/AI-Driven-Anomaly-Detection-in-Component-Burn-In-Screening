@@ -29,6 +29,7 @@ Detecting subtle component anomalies requires balancing fast early-rejection wit
 1. **Stage 1 ($t = 0\text{h}$ Baseline Screening):** Fast univariate statistical filtering to catch immediate extreme outliers without heavy computation.
 2. **Stage 2 ($t = 24\text{h}$ Temporal Drift Analysis):** Tracking borderline components over time to identify temporal degradation.
 3. **Stage 3 (Multivariate Isolation Forest):** Capturing complex inter-dependencies across multiple current types.
+    We first bring down the size of our data set using a quick stage 1 and implement a much tighter but computation heavy bound in the following stages.
 
 ---
 
