@@ -4,10 +4,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.metrics import confusion_matrix
 
-# =====================================================================
 # 1. LOAD DATA & INITIAL CONFIGURATION
-# =====================================================================
-FILE_PATH = '/content/significant_changes_training_data.csv'  # Replace with your actual filename if different
+
+FILE_PATH = 'data_set_1.csv'  # Replace with data_set_2.csv if you want to test that 
 df = pd.read_csv(FILE_PATH)
 
 # Target encoding: Faulty / Anomaly = 1, Normal = 0
@@ -18,9 +17,8 @@ train_df, test_df = train_test_split(
     df, test_size=0.20, random_state=42, stratify=df['Target']
 )
 
-# =====================================================================
 # 2. FEATURE ENGINEERING ENGINE (0h to 24h Early Screening Window)
-# =====================================================================
+
 def generate_screening_features(data_frame: pd.DataFrame) -> pd.DataFrame:
     df_feat = data_frame.copy()
     params = ['Iddq_uA', 'Leakage_nA', 'PropDelay_ns']
@@ -62,15 +60,13 @@ feature_cols = [
     'leak_per_iddq_24h', 'delay_per_iddq_24h'
 ] + mod_z_cols
 
-# =====================================================================
-# 3. MODULE A: DYNAMIC LOT-LEVEL OUTLIER SCREENING
-# =====================================================================
+#MODULE A
+
 Z_THRESHOLD = 2.5
 test_feat['module_a_reject'] = (test_feat[mod_z_cols].abs() > Z_THRESHOLD).any(axis=1)
 
-# =====================================================================
-# 4. MODULE B: TIME-SERIES REGRESSION & GUARDED PREDICTIVE SCREENING
-# =====================================================================
+#MODULE_B
+
 # Train Gradient Boosting Classifier tuned for hyper-sensitive detection
 clf = HistGradientBoostingClassifier(random_state=42, max_iter=200)
 clf.fit(train_feat[feature_cols], train_feat['Target'])
@@ -112,14 +108,10 @@ test_feat['module_b_reject'] = (test_probs > GUARDED_PROB_THRESHOLD) | slope_vio
 # Final Combined Screening Decision
 test_feat['Final_Decision'] = (test_feat['module_a_reject'] | test_feat['module_b_reject']).astype(int)
 
-# =====================================================================
-# 5. METRICS REPORTING
-# =====================================================================
 y_true = test_feat['Target'].values
 y_pred = test_feat['Final_Decision'].values
 
 # Confusion matrix breakdown
-# TN: Working kept, FP: Working rejected, FN: Faulty missed, TP: Faulty caught
 tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
 
 print("=" * 60)
