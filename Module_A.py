@@ -1,192 +1,136 @@
-import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.metrics import confusion_matrix
 
 # =====================================================================
-# 1. LOAD DATASET & ADVANCED FEATURE ENGINEERING
+# 1. LOAD DATA & INITIAL CONFIGURATION
 # =====================================================================
-file_path = "ess_test_data_electrical_v2.csv"
-df = pd.read_csv(file_path)
+FILE_PATH = '/content/significant_changes_training_data.csv'  # Replace with your actual filename if different
+df = pd.read_csv(FILE_PATH)
 
-# Standardize column headers
-df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
+# Target encoding: Faulty / Anomaly = 1, Normal = 0
+df['Target'] = (df['Ground_Truth'] != 'Normal').astype(int)
 
-# 1a. Absolute & Relative Drift Features (Captures Subtle Parametric Shifts)
-time_points = [24, 96, 168]
-drift_cols = []
-rel_drift_cols = []
-for t in time_points:
-    for param in ["iddq_ua", "leakage_na", "propdelay_ns"]:
-        d_col = f"{param}_drift_{t}h"
-        r_col = f"{param}_rel_drift_{t}h"
-        
-        df[d_col] = df[f"{param}_{t}h"] - df[f"{param}_0h"]
-        # Relative percentage change to amplify minor dynamic shifts
-        df[r_col] = df[d_col] / (df[f"{param}_0h"].abs() + 1e-5)
-        
-        drift_cols.append(d_col)
-        rel_drift_cols.append(r_col)
-
-# 1b. Acceleration Features (Second-order burn-in derivative for Dynamic_Outlier)
-accel_cols = []
-for param in ["iddq_ua", "leakage_na", "propdelay_ns"]:
-    col1 = f"{param}_accel_96_24"
-    col2 = f"{param}_accel_168_96"
-    df[col1] = df[f"{param}_drift_96h"] - df[f"{param}_drift_24h"]
-    df[col2] = df[f"{param}_drift_168h"] - df[f"{param}_drift_96h"]
-    accel_cols.extend([col1, col2])
-
-# 1c. Cross-Parameter Interactions
-df["leakage_iddq_ratio_0h"] = df["leakage_na_0h"] / (df["iddq_ua_0h"] + 1e-5)
-df["prop_iddq_ratio_0h"] = df["propdelay_ns_0h"] / (df["iddq_ua_0h"] + 1e-5)
-
-# Stratified 90% Train / 10% Test Split
+# Train (80%) / Test (20%) split stratified by ground truth
 train_df, test_df = train_test_split(
-    df, test_size=0.10, random_state=42, stratify=df["ground_truth"]
+    df, test_size=0.20, random_state=42, stratify=df['Target']
 )
-train_df = train_df.copy()
-test_df = test_df.copy()
-
-print(f"Dataset Split: {len(train_df)} Train Samples (90%), {len(test_df)} Test Samples (10%)\n")
-
-cols_0h = ["iddq_ua_0h", "leakage_na_0h", "propdelay_ns_0h"]
-all_stat_cols = cols_0h + drift_cols + accel_cols
-
-ignore_cols = ["component_id", "lot_id", "ground_truth"]
-ml_feature_cols = [c for c in train_df.columns if c not in ignore_cols]
 
 # =====================================================================
-# 2. STATISTICAL UTILITIES
+# 2. FEATURE ENGINEERING ENGINE (0h to 24h Early Screening Window)
 # =====================================================================
-def fit_mad_statistics(train_data, columns):
-    """Computes Median and MAD statistics exclusively on Training set."""
-    stats = {}
-    for col in columns:
-        median = train_data[col].median()
-        mad = (train_data[col] - median).abs().median()
-        if mad == 0:
-            mad = 1e-6
-        stats[col] = (median, mad)
-    return stats
-
-def compute_zscore_matrix(target_data, stats, columns):
-    """Computes Modified Z-score matrix for target parameters."""
-    z_matrix = pd.DataFrame(index=target_data.index)
-    for col in columns:
-        median, mad = stats[col]
-        z_matrix[col] = 0.6745 * (target_data[col] - median).abs() / mad
-    return z_matrix
-
-stats_all = fit_mad_statistics(train_df, all_stat_cols)
-
-# =====================================================================
-# 3. STAGE 1 & 2: REFINED STATISTICAL SCREENING
-# =====================================================================
-def run_statistical_screening(dataset):
-    z_0h = compute_zscore_matrix(dataset, stats_all, cols_0h)
+def generate_screening_features(data_frame: pd.DataFrame) -> pd.DataFrame:
+    df_feat = data_frame.copy()
+    params = ['Iddq_uA', 'Leakage_nA', 'PropDelay_ns']
     
-    # Stage 1: Targeted threshold for baseline leakage (Z >= 2.5) isolates static Leakage_Only_Outlier
-    leakage_s1 = z_0h["leakage_na_0h"] >= 2.5
-    other_s1 = z_0h[["iddq_ua_0h", "propdelay_ns_0h"]].max(axis=1) >= 3.2
-    s1_coincidence = (z_0h >= 2.3).sum(axis=1) >= 2
-    s1_watchlist = (z_0h.max(axis=1) >= 1.8) & ~leakage_s1 & ~other_s1 & ~s1_coincidence
+    # Temporal Drift & Slope features from early screening (0h -> 24h)
+    for p in params:
+        p0, p24 = f'{p}_0h', f'{p}_24h'
+        df_feat[f'{p}_drift_24h'] = df_feat[p24] - df_feat[p0]
+        df_feat[f'{p}_rel_drift'] = df_feat[f'{p}_drift_24h'] / (np.abs(df_feat[p0]) + 1e-6)
+        df_feat[f'{p}_slope_24h'] = df_feat[f'{p}_drift_24h'] / 24.0
+        df_feat[f'{p}_linear_proj_168h'] = df_feat[p0] + (df_feat[f'{p}_slope_24h'] * 168.0)
     
-    stage1_flag = np.select(
-        [leakage_s1 | other_s1 | s1_coincidence, s1_watchlist],
-        ["Stage1_Outlier", "Watchlist"],
-        default="Pass"
-    )
-    
-    # Stage 2: Drift & Acceleration Screening
-    z_drift = compute_zscore_matrix(dataset, stats_all, drift_cols)
-    z_accel = compute_zscore_matrix(dataset, stats_all, accel_cols)
-    
-    s2_drift_extreme = z_drift.max(axis=1) >= 3.0
-    s2_accel_extreme = z_accel.max(axis=1) >= 3.0
-    s2_watchlist_drift = (stage1_flag == "Watchlist") & (z_drift.max(axis=1) >= 2.1)
-    
-    stage2_flag = np.where(
-        s2_drift_extreme | s2_accel_extreme | s2_watchlist_drift,
-        "Stage2_Drift_Outlier",
-        "Pass"
-    )
-    return stage1_flag, stage2_flag
+    # Cross-parameter interactions (decoupling indicators)
+    df_feat['leak_per_iddq_24h'] = df_feat['Leakage_nA_24h'] / (df_feat['Iddq_uA_24h'] + 1e-5)
+    df_feat['delay_per_iddq_24h'] = df_feat['PropDelay_ns_24h'] / (df_feat['Iddq_uA_24h'] + 1e-5)
 
-train_s1_flag, train_s2_flag = run_statistical_screening(train_df)
-test_df["stage1_flag"], test_df["stage2_flag"] = run_statistical_screening(test_df)
+    # Module A: Lot-aware Modified Z-Scores (MAD strategy)
+    for p in params:
+        for suffix in ['0h', '24h', 'drift_24h']:
+            col = f'{p}_{suffix}'
+            def calc_mod_z(s):
+                med = s.median()
+                mad = np.median(np.abs(s - med))
+                return 0.6745 * (s - med) / (mad + 1e-8)
+            
+            df_feat[f'{col}_mod_z'] = df_feat.groupby('Lot_ID')[col].transform(calc_mod_z)
+            
+    return df_feat
+
+train_feat = generate_screening_features(train_df)
+test_feat = generate_screening_features(test_df)
+
+# Feature matrix setup
+mod_z_cols = [c for c in train_feat.columns if c.endswith('_mod_z')]
+feature_cols = [
+    'Iddq_uA_0h', 'Iddq_uA_24h', 'Iddq_uA_drift_24h', 'Iddq_uA_rel_drift', 'Iddq_uA_slope_24h', 'Iddq_uA_linear_proj_168h',
+    'Leakage_nA_0h', 'Leakage_nA_24h', 'Leakage_nA_drift_24h', 'Leakage_nA_rel_drift', 'Leakage_nA_slope_24h', 'Leakage_nA_linear_proj_168h',
+    'PropDelay_ns_0h', 'PropDelay_ns_24h', 'PropDelay_ns_drift_24h', 'PropDelay_ns_rel_drift', 'PropDelay_ns_slope_24h', 'PropDelay_ns_linear_proj_168h',
+    'leak_per_iddq_24h', 'delay_per_iddq_24h'
+] + mod_z_cols
 
 # =====================================================================
-# 4. STAGE 3: MACHINE LEARNING ENGINE WITH ROBUST SCALER & GUARDED FLOOR
+# 3. MODULE A: DYNAMIC LOT-LEVEL OUTLIER SCREENING
 # =====================================================================
-# RobustScaler uses median and IQR, preventing extreme outliers from compressing normal distribution
-scaler = RobustScaler()
-X_train_scaled = scaler.fit_transform(train_df[ml_feature_cols])
-X_test_scaled = scaler.transform(test_df[ml_feature_cols])
+Z_THRESHOLD = 2.5
+test_feat['module_a_reject'] = (test_feat[mod_z_cols].abs() > Z_THRESHOLD).any(axis=1)
 
-y_train_binary = (train_df["ground_truth"] != "Normal").astype(int)
-y_test_binary = (test_df["ground_truth"] != "Normal").astype(int)
+# =====================================================================
+# 4. MODULE B: TIME-SERIES REGRESSION & GUARDED PREDICTIVE SCREENING
+# =====================================================================
+# Train Gradient Boosting Classifier tuned for hyper-sensitive detection
+clf = HistGradientBoostingClassifier(random_state=42, max_iter=200)
+clf.fit(train_feat[feature_cols], train_feat['Target'])
 
-rf_model = RandomForestClassifier(
-    n_estimators=350,
-    max_depth=15,
-    min_samples_leaf=1,
-    class_weight="balanced_subsample",
-    random_state=42
+# Predict anomaly probabilities on test set
+test_probs = clf.predict_proba(test_feat[feature_cols])[:, 1]
+
+# Train 168h Parameter Regressors for Guarded Safety Slope Validation
+reg_iddq = HistGradientBoostingRegressor(random_state=42).fit(train_feat[feature_cols], train_feat['Iddq_uA_168h'])
+reg_leak = HistGradientBoostingRegressor(random_state=42).fit(train_feat[feature_cols], train_feat['Leakage_nA_168h'])
+reg_delay = HistGradientBoostingRegressor(random_state=42).fit(train_feat[feature_cols], train_feat['PropDelay_ns_168h'])
+
+# Forecast 168h end-of-life state
+test_feat['pred_iddq_168h'] = reg_iddq.predict(test_feat[feature_cols])
+test_feat['pred_leak_168h'] = reg_leak.predict(test_feat[feature_cols])
+test_feat['pred_delay_168h'] = reg_delay.predict(test_feat[feature_cols])
+
+# Derive safety slope limits from 99th percentile of known normal training parts
+normal_train = train_feat[train_feat['Target'] == 0]
+limit_iddq_slope = (normal_train['Iddq_uA_168h'] - normal_train['Iddq_uA_0h']).quantile(0.99) / 168.0
+limit_leak_slope = (normal_train['Leakage_nA_168h'] - normal_train['Leakage_nA_0h']).quantile(0.99) / 168.0
+limit_delay_slope = (normal_train['PropDelay_ns_168h'] - normal_train['PropDelay_ns_0h']).quantile(0.99) / 168.0
+
+# Calculate predicted slopes on test set
+test_feat['pred_iddq_slope'] = (test_feat['pred_iddq_168h'] - test_feat['Iddq_uA_0h']) / 168.0
+test_feat['pred_leak_slope'] = (test_feat['pred_leak_168h'] - test_feat['Leakage_nA_0h']) / 168.0
+test_feat['pred_delay_slope'] = (test_feat['pred_delay_168h'] - test_feat['PropDelay_ns_0h']) / 168.0
+
+slope_violation = (
+    (test_feat['pred_iddq_slope'] > limit_iddq_slope) |
+    (test_feat['pred_leak_slope'] > limit_leak_slope) |
+    (test_feat['pred_delay_slope'] > limit_delay_slope)
 )
-rf_model.fit(X_train_scaled, y_train_binary)
 
-# Evaluate uncaught training anomalies to set minimum sensitivity threshold
-train_caught_by_s1_s2 = (train_s1_flag == "Stage1_Outlier") | (train_s2_flag == "Stage2_Drift_Outlier")
-train_probs = rf_model.predict_proba(X_train_scaled)[:, 1]
-uncaught_train_mask = (y_train_binary == 1) & (~train_caught_by_s1_s2)
+# Ultra-pessimistic decision threshold (0.05) to prioritize Recall over Precision
+GUARDED_PROB_THRESHOLD = 0.05
+test_feat['module_b_reject'] = (test_probs > GUARDED_PROB_THRESHOLD) | slope_violation
 
-if uncaught_train_mask.sum() > 0:
-    min_uncaught_prob = float(train_probs[uncaught_train_mask].min())
-    # Guard floor at 0.18 to prevent threshold collapse while retaining full sensitivity
-    ml_threshold = max(0.18, min_uncaught_prob * 0.98)
-else:
-    ml_threshold = 0.30
-
-test_probs = rf_model.predict_proba(X_test_scaled)[:, 1]
-test_df["stage3_flag"] = np.where(test_probs >= ml_threshold, "Stage3_ML_Outlier", "Pass")
+# Final Combined Screening Decision
+test_feat['Final_Decision'] = (test_feat['module_a_reject'] | test_feat['module_b_reject']).astype(int)
 
 # =====================================================================
-# 5. PIPELINE AGGREGATION & EVALUATION
+# 5. METRICS REPORTING
 # =====================================================================
-test_df["predicted_anomaly"] = (
-    (test_df["stage1_flag"] == "Stage1_Outlier") |
-    (test_df["stage2_flag"] == "Stage2_Drift_Outlier") |
-    (test_df["stage3_flag"] == "Stage3_ML_Outlier")
-)
-test_df["actual_anomaly"] = y_test_binary == 1
+y_true = test_feat['Target'].values
+y_pred = test_feat['Final_Decision'].values
 
-acc = accuracy_score(test_df["actual_anomaly"], test_df["predicted_anomaly"])
-prec = precision_score(test_df["actual_anomaly"], test_df["predicted_anomaly"], zero_division=0)
-rec = recall_score(test_df["actual_anomaly"], test_df["predicted_anomaly"], zero_division=0)
-f1 = f1_score(test_df["actual_anomaly"], test_df["predicted_anomaly"], zero_division=0)
+# Confusion matrix breakdown
+# TN: Working kept, FP: Working rejected, FN: Faulty missed, TP: Faulty caught
+tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
 
-normal_mask = test_df["ground_truth"] == "Normal"
-total_normals = normal_mask.sum()
-fp_normals = (test_df["predicted_anomaly"] & normal_mask).sum()
-scrap_rate = (fp_normals / total_normals) * 100
-
-print(f"Calibrated ML Decision Threshold: {ml_threshold:.4f}")
-print(f"Normal Component False Scrap Rate: {scrap_rate:.2f}% ({fp_normals}/{total_normals} good parts rejected)\n")
-
-print("=== PIPELINE EVALUATION METRICS (10% TEST SET) ===")
-print(f"Accuracy:  {acc:.2%}")
-print(f"Precision: {prec:.2%}")
-print(f"Recall:    {rec:.2%}")
-print(f"F1-Score:  {f1:.2%}")
-print("-" * 50)
-
-print("\n=== CONFUSION MATRIX BY GROUND TRUTH CLASS ===")
-print(pd.crosstab(
-    test_df["ground_truth"],
-    test_df["predicted_anomaly"],
-    rownames=["Ground Truth"],
-    colnames=["Predicted Anomaly"]
-))
+print("=" * 60)
+print(f"       ESS SCREENING MODEL TEST RESULTS (Total Tested: {len(test_feat)})")
+print("=" * 60)
+print(f"Total Faulty Components in Test Set   : {y_true.sum()}")
+print(f"Total Working Components in Test Set  : {(y_true == 0).sum()}")
+print("-" * 60)
+print(f"Faulty components deemed fine (FN)   : {fn}")
+print(f"Working components rejected (FP)      : {fp}")
+print("-" * 60)
+print(f"Faulty Capture Rate (Recall)          : {(tp / (tp + fn)) * 100:.2f}%")
+print(f"Yield Loss Rate (False Positives)     : {(fp / (tn + fp)) * 100:.2f}%")
+print("=" * 60)
